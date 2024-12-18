@@ -58,11 +58,11 @@ static const std::bitset<11>
 HardwareInterface::HardwareInterface()
   : joint_position_command_({ 0, 0, 0, 0, 0, 0 })
   , joint_velocity_command_({ 0, 0, 0, 0, 0, 0 })
-  , cartesian_velocity_command_({ 0, 0, 0, 0, 0, 0 })
-  , cartesian_pose_command_({ 0, 0, 0, 0, 0, 0 })
   , joint_positions_{ { 0, 0, 0, 0, 0, 0 } }
   , joint_velocities_{ { 0, 0, 0, 0, 0, 0 } }
   , joint_efforts_{ { 0, 0, 0, 0, 0, 0 } }
+  , cartesian_velocity_command_({ 0, 0, 0, 0, 0, 0 })
+  , cartesian_pose_command_({ 0, 0, 0, 0, 0, 0 })
   , standard_analog_input_{ { 0, 0 } }
   , standard_analog_output_{ { 0, 0 } }
   , joint_names_(6)
@@ -176,6 +176,10 @@ bool HardwareInterface::init(ros::NodeHandle& root_nh, ros::NodeHandle& robot_hw
     return false;
   }
 
+  // True if splines should be used as interpolation on the robot controller when forwarding trajectory, if false movej
+  // or movel commands are used
+  use_spline_interpolation_ = robot_hw_nh.param<bool>("use_spline_interpolation", "true");
+
   // Whenever the runtime state of the "External Control" program node in the UR-program changes, a
   // message gets published here. So this is equivalent to the information whether the robot accepts
   // commands from ROS side.
@@ -243,7 +247,7 @@ bool HardwareInterface::init(ros::NodeHandle& root_nh, ros::NodeHandle& robot_hw
     }
     tool_comm_setup->setStopBits(stop_bits);
 
-    int rx_idle_chars;
+    float rx_idle_chars;
     // Number of idle chars for the RX unit used for tool communication. Will be set as soon as the UR-Program on the
     // robot is started. Valid values: min=1.0, max=40.0
     //
@@ -257,7 +261,7 @@ bool HardwareInterface::init(ros::NodeHandle& root_nh, ros::NodeHandle& robot_hw
     tool_comm_setup->setRxIdleChars(rx_idle_chars);
     tool_comm_setup->setParity(static_cast<urcl::Parity>(parity));
 
-    int tx_idle_chars;
+    float tx_idle_chars;
     // Number of idle chars for the TX unit used for tool communication. Will be set as soon as the UR-Program on the
     // robot is started. Valid values: min=0.0, max=40.0
     //
@@ -431,8 +435,9 @@ bool HardwareInterface::init(ros::NodeHandle& root_nh, ros::NodeHandle& robot_hw
   // doing. Using this with other controllers might lead to unexpected behaviors.
   set_speed_slider_srv_ = robot_hw_nh.advertiseService("set_speed_slider", &HardwareInterface::setSpeedSlider, this);
 
-  // Service to set any of the robot's IOs
+  // Services to set any of the robot's IOs
   set_io_srv_ = robot_hw_nh.advertiseService("set_io", &HardwareInterface::setIO, this);
+  set_analog_output_srv_ = robot_hw_nh.advertiseService("set_analog_output", &HardwareInterface::setAnalogOutput, this);
 
   if (headless_mode)
   {
@@ -450,6 +455,15 @@ bool HardwareInterface::init(ros::NodeHandle& root_nh, ros::NodeHandle& robot_hw
 
   // Setup the mounted payload through a ROS service
   set_payload_srv_ = robot_hw_nh.advertiseService("set_payload", &HardwareInterface::setPayload, this);
+
+  // Call this to activate or deactivate using spline interpolation locally on the UR controller, when forwarding
+  // trajectories to the UR robot.
+  activate_spline_interpolation_srv_ = robot_hw_nh.advertiseService(
+      "activate_spline_interpolation", &HardwareInterface::activateSplineInterpolation, this);
+
+  // Calling this service will return the software version of the robot.
+  get_robot_software_version_srv =
+      robot_hw_nh.advertiseService("get_robot_software_version", &HardwareInterface::getRobotSoftwareVersion, this);
 
   ur_driver_->startRTDECommunication();
   ROS_INFO_STREAM_NAMED("hardware_interface", "Loaded ur_robot_driver hardware_interface");
@@ -1122,6 +1136,16 @@ bool HardwareInterface::setIO(ur_msgs::SetIORequest& req, ur_msgs::SetIOResponse
   return true;
 }
 
+bool HardwareInterface::setAnalogOutput(ur_msgs::SetAnalogOutputRequest& req, ur_msgs::SetAnalogOutputResponse& res)
+{
+  if (ur_driver_)
+  {
+    res.success = ur_driver_->getRTDEWriter().sendStandardAnalogOutput(
+        req.data.pin, req.data.state, static_cast<urcl::AnalogOutputType>(req.data.domain));
+  }
+  return true;
+}
+
 bool HardwareInterface::resendRobotProgram(std_srvs::TriggerRequest& req, std_srvs::TriggerResponse& res)
 {
   res.success = ur_driver_->sendRobotProgram();
@@ -1166,6 +1190,17 @@ bool HardwareInterface::setPayload(ur_msgs::SetPayloadRequest& req, ur_msgs::Set
   return true;
 }
 
+bool HardwareInterface::getRobotSoftwareVersion(ur_msgs::GetRobotSoftwareVersionRequest& req,
+                                                ur_msgs::GetRobotSoftwareVersionResponse& res)
+{
+  urcl::VersionInformation version_info = this->ur_driver_->getVersion();
+  res.major = version_info.major;
+  res.minor = version_info.minor;
+  res.bugfix = version_info.bugfix;
+  res.build = version_info.build;
+  return true;
+}
+
 void HardwareInterface::commandCallback(const std_msgs::StringConstPtr& msg)
 {
   std::string str = msg->data;
@@ -1188,6 +1223,21 @@ void HardwareInterface::commandCallback(const std_msgs::StringConstPtr& msg)
   {
     ROS_ERROR_STREAM("Error sending script to robot");
   }
+}
+
+bool HardwareInterface::activateSplineInterpolation(std_srvs::SetBoolRequest& req, std_srvs::SetBoolResponse& res)
+{
+  use_spline_interpolation_ = req.data;
+  if (use_spline_interpolation_)
+  {
+    res.message = "Activated spline interpolation in forward trajectory mode.";
+  }
+  else
+  {
+    res.message = "Deactivated spline interpolation in forward trajectory mode.";
+  }
+  res.success = true;
+  return true;
 }
 
 void HardwareInterface::publishRobotAndSafetyMode()
@@ -1255,7 +1305,46 @@ void HardwareInterface::startJointInterpolation(const hardware_interface::JointT
     p[4] = point.positions[4];
     p[5] = point.positions[5];
     double next_time = point.time_from_start.toSec();
-    ur_driver_->writeTrajectoryPoint(p, false, next_time - last_time);
+    if (!use_spline_interpolation_)
+    {
+      ur_driver_->writeTrajectoryPoint(p, false, next_time - last_time);
+    }
+    else  // Use spline interpolation
+    {
+      if (point.velocities.size() == 6 && point.accelerations.size() == 6)
+      {
+        urcl::vector6d_t v, a;
+        v[0] = point.velocities[0];
+        v[1] = point.velocities[1];
+        v[2] = point.velocities[2];
+        v[3] = point.velocities[3];
+        v[4] = point.velocities[4];
+        v[5] = point.velocities[5];
+
+        a[0] = point.accelerations[0];
+        a[1] = point.accelerations[1];
+        a[2] = point.accelerations[2];
+        a[3] = point.accelerations[3];
+        a[4] = point.accelerations[4];
+        a[5] = point.accelerations[5];
+        ur_driver_->writeTrajectorySplinePoint(p, v, a, next_time - last_time);
+      }
+      else if (point.velocities.size() == 6)
+      {
+        urcl::vector6d_t v;
+        v[0] = point.velocities[0];
+        v[1] = point.velocities[1];
+        v[2] = point.velocities[2];
+        v[3] = point.velocities[3];
+        v[4] = point.velocities[4];
+        v[5] = point.velocities[5];
+        ur_driver_->writeTrajectorySplinePoint(p, v, next_time - last_time);
+      }
+      else
+      {
+        ROS_ERROR_THROTTLE(1, "Spline interpolation using positions only is not supported.");
+      }
+    }
     last_time = next_time;
   }
   ROS_DEBUG("Finished Sending Trajectory");

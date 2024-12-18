@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.12)
+cmake_minimum_required(VERSION 3.0.2)
 project(ur_robot_driver)
 
 add_definitions( -DROS_BUILD )
@@ -7,6 +7,14 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   message("${PROJECT_NAME}: You did not request a specific build type: selecting 'RelWithDebInfo'.")
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
+
+# Default to off as this only works in environments where a new docker container can be started with the appropriate networking, which
+# might not be possible e.g. inside the buildfarm
+option(
+  UR_ROBOT_DRIVER_BUILD_INTEGRATION_TESTS
+  "Build integration tests using the start_ursim script"
+  OFF
+)
 
 find_package(catkin REQUIRED
   COMPONENTS
@@ -127,7 +135,9 @@ target_link_libraries(controller_stopper_node
 if(CATKIN_ENABLE_TESTING)
   find_package(rostest REQUIRED)
 
-  add_rostest(test/driver.test)
+  if(${UR_ROBOT_DRIVER_BUILD_INTEGRATION_TESTS})
+    add_rostest(test/driver.test)
+  endif()
 endif()
 
 
